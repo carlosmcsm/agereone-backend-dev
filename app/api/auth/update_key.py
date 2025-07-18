@@ -32,6 +32,9 @@ class OpenAIKeyUpdateRequest(BaseModel):
             raise ValueError(f"Model {value} is not supported.")
         return value
 
+
+
+
 @router.post("/update-key")
 @limiter.limit(settings.RATE_LIMIT_UPDATE_KEY)
 async def update_openai_key(
@@ -44,11 +47,6 @@ async def update_openai_key(
     """
     user_id = user["user_id"]
     logger.info(f"User {user_id} updating OpenAI API key/model.")
-
-    # Validate model
-    if data.model not in ALLOWED_MODELS:
-        logger.warning(f"Model {data.model} is not allowed for user {user_id}")
-        raise HTTPException(status_code=400, detail="Model is not supported.")
 
     try:
         upsert_openai_key_and_model(user_id, data.api_key, data.model)
