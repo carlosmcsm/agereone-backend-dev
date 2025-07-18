@@ -2,107 +2,156 @@
 
 import logging
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel, EmailStr, constr
+from pydantic import BaseModel, EmailStr
+from supabase import create_client, Client
 from app.core.config import settings
+from app.utils.validators import is_valid_username, is_strong_password
 from app.core.limiter import limiter
-from supabase import create_client
-
-from app.utils.validators import (
-    is_valid_username,
-    is_strong_password,
-    normalize_username,
-    normalize_email,
-)
 
 logger = logging.getLogger(__name__)
+
 router = APIRouter()
-supabase = create_client(settings.SUPABASE_URL, settings.SUPABASE_ANON_KEY)
+
+supabase: Client = create_client(
+    settings.SUPABASE_URL,
+    settings.SUPABASE_SERVICE_ROLE_KEY
+)
 
 class RegisterRequest(BaseModel):
     email: EmailStr
-    password: constr(min_length=8, max_length=128)
-    first_name: constr(strip_whitespace=True, min_length=1, max_length=50)
-    last_name: constr(strip_whitespace=True, min_length=1, max_length=50)
-    username: constr(strip_whitespace=True, min_length=8, max_length=32)
+    password: str
+    first_name: str
+    last_name: str
+    username: str
 
 @router.post("/register")
-@limiter.limit(settings.RATE_LIMIT_LOGIN)
-async def register_user(request: Request, data: RegisterRequest):
+@limiter.limit(settings.RATE_LIMIT_REGISTER)
+async def register_user(request: Request, req: RegisterRequest):
     """
-    Registers a new user with Supabase Auth and syncs metadata to `public.users` via DB trigger.
-    ---
-    - Validates strong password, username, and email.
-    - No manual insert to `public.users`; handled by DB trigger.
-    - User must click magic link in email to activate account.
-    """
-    email = normalize_email(data.email)
-    password = data.password
-    first_name = data.first_name.strip()
-    last_name = data.last_name.strip()
-    username = normalize_username(data.username)
+    Registers a new user in both Supabase Auth and your own users table.
+    - Enforces username and password policy.
+    - Syncs user_id between Auth and DB.
+    - Sends invite/magic link email.
 
+    Returns:
+        JSON: { message, subdomain }
+    """
+    username = req.username.lower()
+    email = req.email.lower()
     logger.info(f"Attempting registration for email: {email}")
 
-    # --- Custom Validations ---
+    # 1. Username validity (≥8 chars, only letters/numbers, at least one letter)
     if not is_valid_username(username):
-        logger.warning(f"Rejected registration: invalid username '{username}'")
-        raise HTTPException(status_code=400, detail="Invalid username. Must be ≥8 chars, letters/numbers.")
-
-    if not is_strong_password(password):
-        logger.warning(f"Rejected registration for {email}: weak password")
-        raise HTTPException(status_code=400, detail="Password too weak. Must have upper, lower, digit, special char.")
-
-    # (Optional) Check for disallowed usernames, reserved words, etc.
-
-    try:
-        # Supabase Auth signup with user_metadata (will trigger DB sync)
-        response = supabase.auth.sign_up(
-            {"email": email, "password": password},
-            user_metadata={
-                "username": username,
-                "first_name": first_name,
-                "last_name": last_name,
-            }
+        logger.warning(f"Invalid username attempted: {username}")
+        raise HTTPException(
+            status_code=400,
+            detail="Username must be at least 8 characters, only letters and numbers, and contain at least one letter.",
         )
-        logger.info(f"User signed up successfully: {email}")
+
+    # 2. Password strength
+    if not is_strong_password(req.password):
+        logger.warning(f"Weak password for email: {email}")
+        raise HTTPException(
+            status_code=400,
+            detail="Password must be at least 8 characters, with uppercase, lowercase, a number, and a special character."
+        )
+
+    # 3. Email uniqueness (case-insensitive)
+    user_check = supabase.table("users").select("id").eq("email", email).maybe_single().execute()
+    if user_check and getattr(user_check, "data", None):
+        logger.warning(f"Registration failed: Email already exists: {email}")
+        raise HTTPException(status_code=400, detail="Email already exists.")
+
+    # 4. Username uniqueness
+    username_check = supabase.table("users").select("id").eq("username", username).maybe_single().execute()
+    if username_check and getattr(username_check, "data", None):
+        logger.warning(f"Registration failed: Username already exists: {username}")
+        raise HTTPException(status_code=400, detail="Username already exists.")
+
+    # 5. Create user in Supabase Auth (Admin API)
+    try:
+        auth_res = supabase.auth.admin.create_user({
+            "email": email,
+            "password": req.password,
+            "email_confirm": False
+        })
     except Exception as e:
-        logger.error(f"Registration error for {email}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error during registration.")
+        logger.error(f"Auth user creation exception for {email}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to create Auth user.")
+
+    user_obj = getattr(auth_res, "user", None)
+    if not user_obj:
+        detail = getattr(auth_res, "error", None)
+        logger.error(f"Auth user creation error for {email}: {detail}")
+        raise HTTPException(status_code=500, detail="Auth user creation failed.")
+    user_id = str(user_obj.id)
+    logger.info(f"Created Auth user_id {user_id} for email {email}")
+
+    # 6. Insert into your users table
+    try:
+        db_res = supabase.table("users").insert({
+            "id": user_id,
+            "email": email,
+            "first_name": req.first_name,
+            "last_name": req.last_name,
+            "username": username,
+            "plan": "free",
+            "profile_uploaded": False
+        }).execute()
+    except Exception as e:
+        logger.error(f"DB insert exception for user {email}: {e}")
+        raise HTTPException(status_code=500, detail="Could not insert user metadata.")
+
+    if db_res is None or getattr(db_res, "error", None):
+        msg = getattr(db_res.error, "message", None) if db_res and db_res.error else "Could not insert user metadata."
+        logger.error(f"DB insert error for user {email}: {msg}")
+        raise HTTPException(status_code=500, detail=msg)
+
+    # 7. Send invite/magic link email (does not block registration)
+    try:
+        invite_res = supabase.auth.admin.invite_user_by_email(email)
+        if hasattr(invite_res, "error") and invite_res.error:
+            logger.warning(f"Magic link sending failed for {email}: {invite_res.error}")
+    except Exception as e:
+        logger.warning(f"Failed to send magic link for {email}: {e}")
+
+    logger.info(f"User registered successfully: {email}")
 
     return {
-        "message": "Registration successful. Please check your email to verify your account.",
-        "email": email,
-        "username": username
+        "message": "User registered successfully. Please check your email for the confirmation link.",
+        "subdomain": f"{username}.agereone.com"
     }
 
 """
----------------------------------------------------------------------
+-------------------------------------------------------------------------------
 ✅ Purpose:
-    Registers a new user using Supabase Auth. All user data is written to
-    Supabase Auth (authentication) and metadata is copied to `public.users`
-    via a DB trigger—no direct insert needed here.
+    Handles full registration flow for new users (API, dashboard, onboarding).
 
 🔍 What It Does:
-    - Validates all fields and password strength.
-    - Calls Supabase Auth signup (with email, password, metadata).
-    - Does NOT manually insert into public.users table.
-    - Relies on DB trigger for metadata sync.
-    - User must verify via magic link to activate account.
+    - Validates username, password, and checks for unique email/username.
+    - Creates user in Supabase Auth (secure, backend only).
+    - Inserts metadata in your own users table (syncs with Auth user_id).
+    - Sends magic link (invite) for email confirmation (does not block user creation).
 
 📌 Used By:
-    - `/register` API (frontend registration form)
-    - Onboarding and user creation
+    - SaaS dashboard and API for public signups.
+    - Admin onboarding flows.
 
-🧠 Good Practice:
-    - All sensitive errors are only logged, not sent to user.
-    - Rate limit endpoint to prevent abuse.
-    - Usernames and emails always normalized (lowercase, no spaces).
-    - All validation (passwords, usernames) is strict.
+🧠 Best Practices:
+    - Use the SERVICE_ROLE_KEY for backend-only admin API access.
+    - Rate limit to prevent abuse (see @limiter).
+    - Never return internal errors to users (log them server-side).
+    - Always mask/exclude passwords and sensitive fields from responses.
+    - Magic link/email delivery failures are logged but do not block signup.
 
-🔒 Security & Scalability:
-    - Never stores or logs plaintext passwords.
-    - All account actions audited with logging.
-    - Only returns generic errors to clients for security.
+🔒 Security:
+    - All sensitive actions (user creation, metadata insert) are backend only.
+    - No API key or password is ever exposed in logs.
+    - No row is created in your users table without successful Auth registration.
 
----------------------------------------------------------------------
+🚦 Extensibility:
+    - Easily add additional fields (plan, referral, etc).
+    - Add custom onboarding (welcome emails, analytics, etc).
+
+-------------------------------------------------------------------------------
 """
