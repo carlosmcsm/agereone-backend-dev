@@ -46,14 +46,17 @@ async def register_user(request: Request, data: RegisterRequest):
         redirect_url = f"{settings.FRONTEND_URL}/verify-email"
 
         # Call Supabase Auth sign_up without 'options'
-        response = supabase.auth.sign_up(
-            {"email": email, "password": password},
-            user_metadata={
-                "first_name": first_name,
-                "last_name": last_name,
-                "username": username
+        response = supabase.auth.sign_up({
+            "email": email,
+            "password": password,
+            "options": {
+                "data": {
+                    "first_name": first_name,
+                    "last_name": last_name,
+                    "username": username
+                }
             }
-        )
+        })
 
         if response.user:
             logger.info(f"User signed up successfully: {email}")
