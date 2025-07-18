@@ -47,9 +47,12 @@ async def register_user(request: Request, data: RegisterRequest):
 
         # Call Supabase Auth sign_up without 'options'
         response = supabase.auth.sign_up(
-            "email": email,
-            "password": password,
-            "options": {"redirectTo": redirect_url}
+            {"email": email, "password": password},
+            user_metadata={
+                "first_name": first_name,
+                "last_name": last_name,
+                "username": username
+            }
         )
 
         if response.user:
