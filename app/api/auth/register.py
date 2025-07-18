@@ -1,117 +1,108 @@
 # app/api/auth/register.py
 
 import logging
-from fastapi import APIRouter, HTTPException, Request, Depends
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, EmailStr, constr
 from app.core.config import settings
 from app.core.limiter import limiter
-from app.services.supabase import supabase  # Your initialized Supabase client
+from supabase import create_client
+
+from app.utils.validators import (
+    is_valid_username,
+    is_strong_password,
+    normalize_username,
+    normalize_email,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+supabase = create_client(settings.SUPABASE_URL, settings.SUPABASE_ANON_KEY)
 
-# Registration request schema with validation
 class RegisterRequest(BaseModel):
     email: EmailStr
-    password: constr(min_length=8)
-    first_name: constr(min_length=1)
-    last_name: constr(min_length=1)
-    username: constr(min_length=8)
+    password: constr(min_length=8, max_length=128)
+    first_name: constr(strip_whitespace=True, min_length=1, max_length=50)
+    last_name: constr(strip_whitespace=True, min_length=1, max_length=50)
+    username: constr(strip_whitespace=True, min_length=8, max_length=32)
 
 @router.post("/register")
-@limiter.limit(settings.RATE_LIMIT_LOGIN)  # Rate-limit registrations for abuse protection
+@limiter.limit(settings.RATE_LIMIT_LOGIN)
 async def register_user(request: Request, data: RegisterRequest):
     """
-    Registers a new user using Supabase Auth and inserts metadata into public.users.
-
-    The user must verify their email via the magic link sent by Supabase before
-    being able to log in.
-
-    Args:
-        data (RegisterRequest): Registration details including email, password, first/last name, username.
-
-    Returns:
-        JSON response indicating registration success or failure.
+    Registers a new user with Supabase Auth and syncs metadata to `public.users` via DB trigger.
+    ---
+    - Validates strong password, username, and email.
+    - No manual insert to `public.users`; handled by DB trigger.
+    - User must click magic link in email to activate account.
     """
-    email = data.email.lower().strip()
+    email = normalize_email(data.email)
     password = data.password
     first_name = data.first_name.strip()
     last_name = data.last_name.strip()
-    username = data.username.lower().strip()
+    username = normalize_username(data.username)
 
     logger.info(f"Attempting registration for email: {email}")
 
+    # --- Custom Validations ---
+    if not is_valid_username(username):
+        logger.warning(f"Rejected registration: invalid username '{username}'")
+        raise HTTPException(status_code=400, detail="Invalid username. Must be ≥8 chars, letters/numbers.")
+
+    if not is_strong_password(password):
+        logger.warning(f"Rejected registration for {email}: weak password")
+        raise HTTPException(status_code=400, detail="Password too weak. Must have upper, lower, digit, special char.")
+
+    # (Optional) Check for disallowed usernames, reserved words, etc.
+
     try:
-        # Supabase magic link verification redirect URL
-        redirect_url = f"{settings.FRONTEND_URL}/verify-email"
-
-        # Call Supabase Auth sign_up without 'options'
-        response = supabase.auth.sign_up({
-            "email": email,
-            "password": password,
-            "options": {
-                "data": {
-                    "first_name": first_name,
-                    "last_name": last_name,
-                    "username": username
-                }
-            }
-        })
-
-        if response.user:
-            logger.info(f"User signed up successfully: {email}")
-
-            # Insert user metadata into your public.users table
-            user_meta = {
-                "id": response.user.id,
-                "email": email,
+        # Supabase Auth signup with user_metadata (will trigger DB sync)
+        response = supabase.auth.sign_up(
+            {"email": email, "password": password},
+            user_metadata={
                 "username": username,
                 "first_name": first_name,
                 "last_name": last_name,
-                "plan": "free",
             }
-
-            profile_res = supabase.table("users").insert(user_meta).execute()
-            if profile_res.status_code != 201:
-                logger.warning(f"Failed to insert metadata for user {email}: {profile_res.data}")
-            else:
-                logger.info(f"Inserted metadata into public.users for user {email}")
-
-            return {"message": "Registration successful. Please check your email to verify your account."}
-        else:
-            # If user is None, registration failed
-            logger.error(f"Registration failed for {email}: {response}")
-            raise HTTPException(status_code=400, detail="Registration failed. Possibly user already exists.")
-
+        )
+        logger.info(f"User signed up successfully: {email}")
     except Exception as e:
         logger.error(f"Registration error for {email}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error during registration.")
 
+    return {
+        "message": "Registration successful. Please check your email to verify your account.",
+        "email": email,
+        "username": username
+    }
+
 """
---------------------------------------------------------------------
-Purpose:
-    Handles user registration using Supabase Auth with magic-link email verification.
+---------------------------------------------------------------------
+✅ Purpose:
+    Registers a new user using Supabase Auth. All user data is written to
+    Supabase Auth (authentication) and metadata is copied to `public.users`
+    via a DB trigger—no direct insert needed here.
 
-What It Does:
-    - Validates incoming registration data.
-    - Calls Supabase Auth `sign_up` with email, password, and redirect URL for verification.
-    - Inserts user metadata in `public.users` for profile and SaaS info.
-    - Logs all key steps and errors.
-    - Protects endpoint with rate limiting.
+🔍 What It Does:
+    - Validates all fields and password strength.
+    - Calls Supabase Auth signup (with email, password, metadata).
+    - Does NOT manually insert into public.users table.
+    - Relies on DB trigger for metadata sync.
+    - User must verify via magic link to activate account.
 
-Used By:
-    - Frontend registration form.
+📌 Used By:
+    - `/register` API (frontend registration form)
+    - Onboarding and user creation
 
-Good Practice:
-    - Do NOT store passwords yourself; rely on Supabase Auth.
-    - Require email verification before login.
-    - Keep user metadata in a separate table for business logic.
-    - Handle and log all exceptions.
-    - Use strict input validation and normalization.
+🧠 Good Practice:
+    - All sensitive errors are only logged, not sent to user.
+    - Rate limit endpoint to prevent abuse.
+    - Usernames and emails always normalized (lowercase, no spaces).
+    - All validation (passwords, usernames) is strict.
 
-Security & Scalability:
-    - Passwords never leave Supabase Auth.
-    - RLS and policies on `public.users` restrict data access.
-    - Rate limiting prevents abuse and brute force.
---------------------------------------------------------------------
+🔒 Security & Scalability:
+    - Never stores or logs plaintext passwords.
+    - All account actions audited with logging.
+    - Only returns generic errors to clients for security.
+
+---------------------------------------------------------------------
 """
